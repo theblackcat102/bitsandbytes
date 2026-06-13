@@ -17,6 +17,7 @@ interface (sym_mm / sym_baddbmm / mm / mm_add), so it can be attached to a
 GramNewtonSchulz instance as `_kernel_backend`. Non-symmetric products
 (mm / mm_add, i.e. the final Q @ X) stay on cuBLAS.
 """
+
 from __future__ import annotations
 
 from types import SimpleNamespace

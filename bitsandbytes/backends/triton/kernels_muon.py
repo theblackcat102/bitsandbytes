@@ -35,6 +35,7 @@ NF4 uses a 16-entry table (quantiles of N(0,1)) with a hardcoded decision tree
 for both dequantization and quantization, matching the existing Triton kernels
 in bitsandbytes.backends.triton.kernels_4bit.
 """
+
 from __future__ import annotations
 
 import torch
@@ -97,9 +98,7 @@ def _muon_momentum_8bit_fused_kernel(
 
     lower_val = tl.load(qmap_ptr + lower)
     upper_val = tl.load(qmap_ptr + upper)
-    codes = tl.where(
-        tl.abs(m_norm - lower_val) <= tl.abs(m_norm - upper_val), lower, upper
-    ).to(tl.uint8)
+    codes = tl.where(tl.abs(m_norm - lower_val) <= tl.abs(m_norm - upper_val), lower, upper).to(tl.uint8)
 
     tl.store(state1_ptr + offsets, tl.reshape(codes, (BLOCK_SIZE_N * N_PER_TH,)), mask=mask)
     absmax_offsets = block_start_idx + tl.arange(0, N_PER_TH)
@@ -231,16 +230,16 @@ def _quantize_nf4(x):
 @triton.jit
 def _muon_momentum_4bit_fused_kernel(
     g_ptr,
-    state1_ptr,   # packed uint8, shape (n_paired,) = (ceil(n_elements / 2),)
-    absmax_ptr,   # float32, shape (n_blocks,)  = (ceil(n_elements / BLOCKSIZE),)
-    u_ptr,        # output, any float dtype, shape (n_elements,)
+    state1_ptr,  # packed uint8, shape (n_paired,) = (ceil(n_elements / 2),)
+    absmax_ptr,  # float32, shape (n_blocks,)  = (ceil(n_elements / BLOCKSIZE),)
+    u_ptr,  # output, any float dtype, shape (n_elements,)
     beta,
-    n_elements,   # total number of momentum elements
-    n_blocks,     # ceil(n_elements / BLOCKSIZE)
-    n_paired,     # ceil(n_elements / 2)
+    n_elements,  # total number of momentum elements
+    n_blocks,  # ceil(n_elements / BLOCKSIZE)
+    n_paired,  # ceil(n_elements / 2)
     NESTEROV: tl.constexpr,
-    BLOCKSIZE: tl.constexpr,   # NF4 quantisation blocksize (e.g. 64)
-    N_PER_TH: tl.constexpr,   # number of quant blocks handled per program
+    BLOCKSIZE: tl.constexpr,  # NF4 quantisation blocksize (e.g. 64)
+    N_PER_TH: tl.constexpr,  # number of quant blocks handled per program
 ):
     """Single-pass NF4 momentum update kernel.
 
@@ -256,7 +255,7 @@ def _muon_momentum_4bit_fused_kernel(
     PAIRS_PER_PROG: tl.constexpr = N_PER_TH * BLOCKSIZE // 2
 
     pid = tl.program_id(axis=0)
-    blk_start = pid * N_PER_TH          # index of first quant block this program owns
+    blk_start = pid * N_PER_TH  # index of first quant block this program owns
     elem_start = blk_start * BLOCKSIZE  # index of first element
     byte_start = blk_start * BLOCKSIZE // 2  # index of first packed byte
 
@@ -279,11 +278,11 @@ def _muon_momentum_4bit_fused_kernel(
     # ---- Dequantise ----------------------------------------------------------
     # Packing: high nibble (bits 7:4) = first element of pair,
     #          low  nibble (bits 3:0) = second element of pair.
-    code_hi = (packed_2d >> 4) & 0xF   # (N_PER_TH, BLOCKSIZE//2) — first of each pair
-    code_lo = packed_2d & 0xF           # (N_PER_TH, BLOCKSIZE//2) — second of each pair
+    code_hi = (packed_2d >> 4) & 0xF  # (N_PER_TH, BLOCKSIZE//2) — first of each pair
+    code_lo = packed_2d & 0xF  # (N_PER_TH, BLOCKSIZE//2) — second of each pair
 
-    val_hi = _dequantize_nf4(code_hi) * absmax[:, None]   # (N_PER_TH, BLOCKSIZE//2)
-    val_lo = _dequantize_nf4(code_lo) * absmax[:, None]   # (N_PER_TH, BLOCKSIZE//2)
+    val_hi = _dequantize_nf4(code_hi) * absmax[:, None]  # (N_PER_TH, BLOCKSIZE//2)
+    val_lo = _dequantize_nf4(code_lo) * absmax[:, None]  # (N_PER_TH, BLOCKSIZE//2)
 
     # tl.interleave along the last axis:
     # result[b, 2*j] = val_hi[b,j],  result[b, 2*j+1] = val_lo[b,j]
@@ -313,7 +312,7 @@ def _muon_momentum_4bit_fused_kernel(
 
     # Pack pairs: reshape to (N_PER_TH, BLOCKSIZE//2, 2), split along last axis
     code_3d = tl.reshape(code_all, (N_PER_TH, BLOCKSIZE // 2, 2))
-    left_codes, right_codes = code_3d.split()   # each (N_PER_TH, BLOCKSIZE//2)
+    left_codes, right_codes = code_3d.split()  # each (N_PER_TH, BLOCKSIZE//2)
     packed_new = (left_codes << 4) | (right_codes & 0xF)
     packed_flat = tl.reshape(packed_new, (PAIRS_PER_PROG,))
 
@@ -352,13 +351,13 @@ def _dequantize_nvfp4(val):
         mag >= 4,
         tl.where(
             mag >= 6,
-            tl.where(mag >= 7, 1.0, 4.0 / 6.0),          # 7 → 1.0,  6 → 2/3
-            tl.where(mag >= 5, 3.0 / 6.0, 2.0 / 6.0),    # 5 → 0.5,  4 → 1/3
+            tl.where(mag >= 7, 1.0, 4.0 / 6.0),  # 7 → 1.0,  6 → 2/3
+            tl.where(mag >= 5, 3.0 / 6.0, 2.0 / 6.0),  # 5 → 0.5,  4 → 1/3
         ),
         tl.where(
             mag >= 2,
-            tl.where(mag >= 3, 1.5 / 6.0, 1.0 / 6.0),   # 3 → 1/4,  2 → 1/6
-            tl.where(mag >= 1, 0.5 / 6.0, 0.0),          # 1 → 1/12, 0 → 0
+            tl.where(mag >= 3, 1.5 / 6.0, 1.0 / 6.0),  # 3 → 1/4,  2 → 1/6
+            tl.where(mag >= 1, 0.5 / 6.0, 0.0),  # 1 → 1/12, 0 → 0
         ),
     )
     return sign * mag_val
@@ -376,19 +375,19 @@ def _quantize_nvfp4(x):
     x_abs = tl.abs(x)
 
     mag = tl.where(
-        x_abs >= 4.0 / 6.0 + 1.0 / 12.0,   # ≥ 0.8333 → 7
+        x_abs >= 4.0 / 6.0 + 1.0 / 12.0,  # ≥ 0.8333 → 7
         7,
         tl.where(
-            x_abs >= 3.5 / 6.0,              # ≥ 0.5833 → 6
+            x_abs >= 3.5 / 6.0,  # ≥ 0.5833 → 6
             6,
             tl.where(
-                x_abs >= 2.5 / 6.0,          # ≥ 0.4167 → 5
+                x_abs >= 2.5 / 6.0,  # ≥ 0.4167 → 5
                 5,
                 tl.where(
-                    x_abs >= 1.75 / 6.0,     # ≥ 0.2917 → 4
+                    x_abs >= 1.75 / 6.0,  # ≥ 0.2917 → 4
                     4,
                     tl.where(
-                        x_abs >= 1.25 / 6.0, # ≥ 0.2083 → 3
+                        x_abs >= 1.25 / 6.0,  # ≥ 0.2083 → 3
                         3,
                         tl.where(
                             x_abs >= 0.75 / 6.0,  # ≥ 0.125 → 2
@@ -410,16 +409,16 @@ def _quantize_nvfp4(x):
 @triton.jit
 def _muon_momentum_nvfp4_fused_kernel(
     g_ptr,
-    state1_ptr,   # packed uint8, shape (n_paired,) = (ceil(n_elements / 2),)
-    absmax_ptr,   # float32, shape (n_blocks,) = (ceil(n_elements / BLOCKSIZE),)
-    u_ptr,        # output float (any dtype), shape (n_elements,)
+    state1_ptr,  # packed uint8, shape (n_paired,) = (ceil(n_elements / 2),)
+    absmax_ptr,  # float32, shape (n_blocks,) = (ceil(n_elements / BLOCKSIZE),)
+    u_ptr,  # output float (any dtype), shape (n_elements,)
     beta,
     n_elements,
     n_blocks,
     n_paired,
     NESTEROV: tl.constexpr,
-    BLOCKSIZE: tl.constexpr,   # NVFP4 quantisation blocksize (e.g. 64)
-    N_PER_TH: tl.constexpr,   # quant blocks per program
+    BLOCKSIZE: tl.constexpr,  # NVFP4 quantisation blocksize (e.g. 64)
+    N_PER_TH: tl.constexpr,  # quant blocks per program
 ):
     """Single-pass NVFP4 momentum update.  Identical structure to the NF4
     kernel but uses _dequantize_nvfp4 / _quantize_nvfp4 decision trees.

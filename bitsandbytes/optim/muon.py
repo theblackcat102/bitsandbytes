@@ -28,22 +28,24 @@ Memory footprint (approximate, per trainable element):
   -  8-bit:  1 byte   (uint8 blockwise dynamic, blocksize=256)
   -  4-bit:  0.5 byte (NF4/FP4 packed, blocksize=64) + absmax overhead ≈ 0.52 bytes total
 """
+
 from __future__ import annotations
 
-import math
 from collections import defaultdict
-from typing import Callable, List, Optional, Tuple, Union
+from collections.abc import Callable
+import math
+from typing import Optional
 
 import torch
 from torch import Tensor
 
 import bitsandbytes.functional as F
-from bitsandbytes.optim.optimizer import MockArgs, Optimizer8bit, GlobalOptimManager
+from bitsandbytes.optim.optimizer import MockArgs, Optimizer8bit
 
 try:
     from bitsandbytes.backends.triton.kernels_muon import (
-        muon_momentum_8bit_fused,
         muon_momentum_4bit_fused,
+        muon_momentum_8bit_fused,
         muon_momentum_nvfp4_fused,
     )
 except ImportError:  # triton not available
@@ -62,7 +64,7 @@ _UNMODIFIED_POLAR_EXPRESS = [
     (2.300652019954817, -1.6689039845747493, 0.4188073119525673),
 ]
 _SAFETY = 1.05
-POLAR_EXPRESS_COEFFICIENTS: List[Tuple[float, float, float]] = [
+POLAR_EXPRESS_COEFFICIENTS: list[tuple[float, float, float]] = [
     (a / _SAFETY, b / _SAFETY**3, c / _SAFETY**5) for (a, b, c) in _UNMODIFIED_POLAR_EXPRESS
 ]
 
@@ -72,7 +74,7 @@ POLAR_EXPRESS_COEFFICIENTS: List[Tuple[float, float, float]] = [
 # ---------------------------------------------------------------------------
 def _standard_newton_schulz(
     X: Tensor,
-    coefficients: List[Tuple[float, float, float]] = POLAR_EXPRESS_COEFFICIENTS,
+    coefficients: list[tuple[float, float, float]] = POLAR_EXPRESS_COEFFICIENTS,
     eps: float = 1e-7,
 ) -> Tensor:
     """
@@ -128,24 +130,31 @@ def _standard_newton_schulz(
 # NVFP4 Python eager helpers (CPU / Triton-unavailable fallback)
 # ---------------------------------------------------------------------------
 # NVFP4 magnitude values normalised to [-1, 1] (indexed by mag code 0-7):
-_NVFP4_MAG_VALUES: List[float] = [
-    0.0, 0.5 / 6, 1.0 / 6, 1.5 / 6, 2.0 / 6, 3.0 / 6, 4.0 / 6, 1.0,
+_NVFP4_MAG_VALUES: list[float] = [
+    0.0,
+    0.5 / 6,
+    1.0 / 6,
+    1.5 / 6,
+    2.0 / 6,
+    3.0 / 6,
+    4.0 / 6,
+    1.0,
 ]
 # Quantise thresholds: midpoints between adjacent magnitudes (in [0, 1]):
-_NVFP4_THRESHOLDS: List[float] = [
-    0.25 / 6,   # 0 ↔ 1
-    0.75 / 6,   # 1 ↔ 2
-    1.25 / 6,   # 2 ↔ 3
-    1.75 / 6,   # 3 ↔ 4
-    2.5  / 6,   # 4 ↔ 5
-    3.5  / 6,   # 5 ↔ 6
-    5.0  / 6,   # 6 ↔ 7
+_NVFP4_THRESHOLDS: list[float] = [
+    0.25 / 6,  # 0 ↔ 1
+    0.75 / 6,  # 1 ↔ 2
+    1.25 / 6,  # 2 ↔ 3
+    1.75 / 6,  # 3 ↔ 4
+    2.5 / 6,  # 4 ↔ 5
+    3.5 / 6,  # 5 ↔ 6
+    5.0 / 6,  # 6 ↔ 7
 ]
 
 
 def _nvfp4_dequantize_eager(
-    packed: Tensor,   # uint8, flat, (ceil(n/2),)
-    absmax: Tensor,   # float32, (ceil(n/blocksize),)
+    packed: Tensor,  # uint8, flat, (ceil(n/2),)
+    absmax: Tensor,  # float32, (ceil(n/blocksize),)
     n: int,
     blocksize: int,
     device,
@@ -155,13 +164,13 @@ def _nvfp4_dequantize_eager(
     n_paired = (n + 1) // 2
     pairs_per_block = blocksize // 2
 
-    code_hi = (packed >> 4).long()        # (n_paired,) — first element of each pair
-    code_lo = (packed & 0xF).long()       # (n_paired,) — second element
+    code_hi = (packed >> 4).long()  # (n_paired,) — first element of each pair
+    code_lo = (packed & 0xF).long()  # (n_paired,) — second element
 
     sign_hi = torch.where(code_hi >= 8, -1.0, 1.0)
     sign_lo = torch.where(code_lo >= 8, -1.0, 1.0)
-    val_hi = sign_hi * code[code_hi & 0x7]   # (n_paired,)
-    val_lo = sign_lo * code[code_lo & 0x7]   # (n_paired,)
+    val_hi = sign_hi * code[code_hi & 0x7]  # (n_paired,)
+    val_lo = sign_lo * code[code_lo & 0x7]  # (n_paired,)
 
     pair_idx = torch.arange(n_paired, device=device)
     blk_idx = (pair_idx // pairs_per_block).clamp(max=absmax.numel() - 1)
@@ -176,7 +185,7 @@ def _nvfp4_dequantize_eager(
 
 
 def _nvfp4_quantize_eager(
-    m: Tensor,       # float32, flat (n,)
+    m: Tensor,  # float32, flat (n,)
     packed: Tensor,  # uint8, flat (ceil(n/2),) — modified in place
     absmax: Tensor,  # float32 (ceil(n/blocksize),) — modified in place
     blocksize: int,
@@ -192,8 +201,8 @@ def _nvfp4_quantize_eager(
 
     # Per-block absmax
     n_blocks = (n + blocksize - 1) // blocksize
-    m_blk = m.reshape(-1, blocksize)[:n_blocks]   # last block may be partial
-    absmax_new = m_blk.abs().amax(dim=1)           # (n_blocks,)
+    m_blk = m.reshape(-1, blocksize)[:n_blocks]  # last block may be partial
+    absmax_new = m_blk.abs().amax(dim=1)  # (n_blocks,)
     absmax.copy_(absmax_new)
 
     # Per-pair scale
@@ -202,8 +211,8 @@ def _nvfp4_quantize_eager(
     s = absmax_new[blk_idx].clamp(min=1e-12)  # (n_paired,)
 
     # Normalise and quantise (sign-magnitude)
-    m_hi = m_pad[0::2] / s   # (n_paired,) — even elements ∈ [-1, 1]
-    m_lo = m_pad[1::2] / s   # (n_paired,)
+    m_hi = m_pad[0::2] / s  # (n_paired,) — even elements ∈ [-1, 1]
+    m_lo = m_pad[1::2] / s  # (n_paired,)
 
     def _quant_mag(x: Tensor) -> Tensor:
         """Map abs(x) ∈ [0,1] to magnitude code 0-7."""
@@ -223,13 +232,12 @@ def _nvfp4_quantize_eager(
 
 
 # ---------------------------------------------------------------------------
-# NVFP4 × sm100: Newton-Schulz using Blackwell FP4 tensor cores for X @ X.T
+# NVFP4 x sm100: Newton-Schulz using Blackwell FP4 tensor cores for X @ X.T
 # ---------------------------------------------------------------------------
 
-def _to_nvfp4_with_scales(
-    X: Tensor, block_size: int = 16
-) -> Tuple[Tensor, Tensor]:
-    """Pack (M, N) bf16/fp32 tensor into NVFP4 with 1×block_size FP8 block scales.
+
+def _to_nvfp4_with_scales(X: Tensor, block_size: int = 16) -> tuple[Tensor, Tensor]:
+    """Pack (M, N) bf16/fp32 tensor into NVFP4 with 1xblock_size FP8 block scales.
 
     Returns:
         X_fp4:  (M, N//2)      dtype=torch.float4_e2m1fn_x2
@@ -243,47 +251,44 @@ def _to_nvfp4_with_scales(
     """
     X = X.float()
     M, N = X.shape
-    assert N % block_size == 0, (
-        f"_to_nvfp4_with_scales: N={N} must be divisible by block_size={block_size}"
-    )
+    assert N % block_size == 0, f"_to_nvfp4_with_scales: N={N} must be divisible by block_size={block_size}"
     N_blocks = N // block_size
 
     # Per-block absmax → FP8 scales
-    X_blk = X.reshape(M, N_blocks, block_size)                     # (M, Nb, B)
-    absmax = X_blk.abs().amax(dim=-1).clamp(min=1e-12)             # (M, Nb)
+    X_blk = X.reshape(M, N_blocks, block_size)  # (M, Nb, B)
+    absmax = X_blk.abs().amax(dim=-1).clamp(min=1e-12)  # (M, Nb)
     FP4_MAX, FP8_MAX = 6.0, 448.0
     scale_fp8 = (absmax / FP4_MAX).clamp(max=FP8_MAX).to(torch.float8_e4m3fn)  # (M, Nb)
 
     # Normalize to [-FP4_MAX, FP4_MAX] then quantize
     X_norm = (X_blk / absmax.unsqueeze(-1) * FP4_MAX).clamp(-FP4_MAX, FP4_MAX)  # (M, Nb, B)
-    X_flat = X_norm.reshape(M, N)                                   # (M, N)
+    X_flat = X_norm.reshape(M, N)  # (M, N)
 
     x_abs = X_flat.abs()
-    sign_bit = (X_flat < 0).to(torch.int32) * 8                    # (M, N)
-    mag = (x_abs >= 5.0).long()              * 7
-    for thr, lv in [(3.5, 6), (2.5, 5), (1.75, 4), (1.25, 3), (0.75, 2), (0.25, 1)]:
-        mag = torch.where((x_abs >= thr) & (mag == 0), torch.full_like(mag, lv), mag)
+    sign_bit = (X_flat < 0).to(torch.int32) * 8  # (M, N)
+    mag = (x_abs >= 5.0).long() * 7
+    for the, lv in [(3.5, 6), (2.5, 5), (1.75, 4), (1.25, 3), (0.75, 2), (0.25, 1)]:
+        mag = torch.where((x_abs >= the) & (mag == 0), torch.full_like(mag, lv), mag)
     # Compact equivalent:
     mag = (
-        ((x_abs >= 5.0).long()              ) * 7 +
-        ((x_abs >= 3.5) & (x_abs < 5.0)    ).long() * 6 +
-        ((x_abs >= 2.5) & (x_abs < 3.5)    ).long() * 5 +
-        ((x_abs >= 1.75) & (x_abs < 2.5)   ).long() * 4 +
-        ((x_abs >= 1.25) & (x_abs < 1.75)  ).long() * 3 +
-        ((x_abs >= 0.75) & (x_abs < 1.25)  ).long() * 2 +
-        ((x_abs >= 0.25) & (x_abs < 0.75)  ).long() * 1
+        ((x_abs >= 5.0).long()) * 7
+        + ((x_abs >= 3.5) & (x_abs < 5.0)).long() * 6
+        + ((x_abs >= 2.5) & (x_abs < 3.5)).long() * 5
+        + ((x_abs >= 1.75) & (x_abs < 2.5)).long() * 4
+        + ((x_abs >= 1.25) & (x_abs < 1.75)).long() * 3
+        + ((x_abs >= 0.75) & (x_abs < 1.25)).long() * 2
+        + ((x_abs >= 0.25) & (x_abs < 0.75)).long() * 1
     )
     codes = (sign_bit | mag).to(torch.uint8)  # (M, N), values 0-15
 
     # Pack pairs (odd → high nibble, even → low nibble — matches pack_uint4)
-    packed = (codes[:, 1::2].to(torch.int32) << 4 | codes[:, ::2].to(torch.int32) & 0xF
-              ).to(torch.uint8)              # (M, N//2)
-    X_fp4 = packed.view(torch.float4_e2m1fn_x2)                    # (M, N//2)
+    packed = (codes[:, 1::2].to(torch.int32) << 4 | codes[:, ::2].to(torch.int32) & 0xF).to(torch.uint8)  # (M, N//2)
+    X_fp4 = packed.view(torch.float4_e2m1fn_x2)  # (M, N//2)
     return X_fp4, scale_fp8
 
 
 def _make_sm100_nvfp4_ns_fn(
-    coefficients: List[Tuple[float, float, float]] = POLAR_EXPRESS_COEFFICIENTS,
+    coefficients: list[tuple[float, float, float]] = POLAR_EXPRESS_COEFFICIENTS,
     eps: float = 1e-7,
 ) -> Callable[[Tensor], Tensor]:
     """Return a Newton-Schulz function that uses Blackwell sm100 FP4 tensor
@@ -302,26 +307,33 @@ def _make_sm100_nvfp4_ns_fn(
     """
     try:
         from torch.nn.functional import ScalingType, SwizzleType
+
         _sgmm = torch._scaled_grouped_mm_v2
     except (ImportError, AttributeError):
         return _default_orthogonalize_fn
 
     def _fp4_gram(X_single: Tensor) -> Tensor:
         """Compute X @ X.T for one (m, n) matrix using sm100 FP4 GEMM → bf16."""
-        m, n = X_single.shape
+        _m, n = X_single.shape
         if n % 16 != 0:
             # Dimensions not suitable for BlockWise1x16; use bf16 fallback.
             return X_single @ X_single.mT
         X_fp4, scale_X = _to_nvfp4_with_scales(X_single.contiguous(), block_size=16)
         # mat2 = X.T packed as mat2: transpose the packed tensor (each byte
         # still encodes the correct pair of elements for the contracted K dim).
-        X_T_fp4 = X_fp4.t().contiguous()   # (n//2, m)
+        X_T_fp4 = X_fp4.t().contiguous()  # (n//2, m)
         scale_X_T = scale_X.t().contiguous()  # (n//16, m)
         return _sgmm(
-            X_fp4, X_T_fp4,
-            [scale_X],   [ScalingType.BlockWise1x16], [SwizzleType.SWIZZLE_32_4_4],
-            [scale_X_T], [ScalingType.BlockWise1x16], [SwizzleType.SWIZZLE_32_4_4],
-            None, torch.bfloat16,
+            X_fp4,
+            X_T_fp4,
+            [scale_X],
+            [ScalingType.BlockWise1x16],
+            [SwizzleType.SWIZZLE_32_4_4],
+            [scale_X_T],
+            [ScalingType.BlockWise1x16],
+            [SwizzleType.SWIZZLE_32_4_4],
+            None,
+            torch.bfloat16,
         )
 
     def _nvfp4_ns(X: Tensor) -> Tensor:
@@ -345,7 +357,7 @@ def _make_sm100_nvfp4_ns_fn(
             X = X.mT.contiguous()
             transposed = True
 
-        B, m, n = X.shape
+        B, _m, _n = X.shape
 
         for a, b, c in coefficients:
             # FP4 GEMM for X @ X.T (one call per batch element)
@@ -387,8 +399,8 @@ def _make_default_orthogonalize_fn() -> Callable[[Tensor], Tensor]:
     """
     Prefer GramNewtonSchulz (Dao-AILab) when the package is importable.
 
-    The Gram iteration runs on the small n×n Gram matrix instead of the full
-    m×n matrix (~2x fewer FLOPs and far smaller transients for rectangular
+    The Gram iteration runs on the small nxn Gram matrix instead of the full
+    mxn matrix (~2x fewer FLOPs and far smaller transients for rectangular
     weights) and works on any GPU through its torch backend. The CuTeDSL
     symmetric-GEMM kernels are only enabled on sm90/sm100 (H100/B200) when
     quack is installed; consumer/workstation Blackwell (sm120) is not a
@@ -439,12 +451,12 @@ def _get_default_orthogonalize_fn() -> Callable[[Tensor], Tensor]:
 # ---------------------------------------------------------------------------
 # LR adjustment helpers (ported from gram-newton-schulz)
 # ---------------------------------------------------------------------------
-def _adjust_lr_rms_norm(lr: float, shape: Tuple[int, ...]) -> float:
+def _adjust_lr_rms_norm(lr: float, shape: tuple[int, ...]) -> float:
     fan_out, fan_in = shape[-2], shape[-1]
     return lr * 0.2 * math.sqrt(max(fan_out, fan_in))
 
 
-def _adjust_lr_spectral_norm(lr: float, shape: Tuple[int, ...]) -> float:
+def _adjust_lr_spectral_norm(lr: float, shape: tuple[int, ...]) -> float:
     fan_out, fan_in = shape[-2], shape[-1]
     return lr * math.sqrt(fan_out / fan_in)
 
@@ -456,7 +468,7 @@ _ADJUST_LR_MAP = {
 }
 
 
-def _resolve_adjust_lr(adjust_lr) -> Callable[[float, Tuple[int, ...]], float]:
+def _resolve_adjust_lr(adjust_lr) -> Callable[[float, tuple[int, ...]], float]:
     if adjust_lr is None:
         return lambda lr, shape: lr
     if isinstance(adjust_lr, str):
@@ -473,7 +485,7 @@ def _resolve_adjust_lr(adjust_lr) -> Callable[[float, Tuple[int, ...]], float]:
 # ---------------------------------------------------------------------------
 # Parameter batching (group same-shape params for batched NS)
 # ---------------------------------------------------------------------------
-def _create_param_batches(params: List[Tensor]) -> List[List[Tensor]]:
+def _create_param_batches(params: list[Tensor]) -> list[list[Tensor]]:
     """Group params by (shape, dtype, device) for a single batched NS call."""
     groups: dict = defaultdict(list)
     for p in params:
@@ -494,7 +506,7 @@ def _split_tensor_for_orthogonalization(x: Tensor):
     return [x.reshape(x.shape[0], -1)], ("flatten", x.shape)
 
 
-def _reconstruct_tensor_from_matrices(spec, matrices: List[Tensor]) -> Tensor:
+def _reconstruct_tensor_from_matrices(spec, matrices: list[Tensor]) -> Tensor:
     kind, shape = spec
     if kind == "matrix":
         return matrices[0]
@@ -505,7 +517,7 @@ def _reconstruct_tensor_from_matrices(spec, matrices: List[Tensor]) -> Tensor:
     raise RuntimeError(f"Unknown Muon reconstruction spec: {kind}")
 
 
-def _validate_param_split_fn(param_split_fn: Callable, x: Tensor, splits) -> List[Tensor]:
+def _validate_param_split_fn(param_split_fn: Callable, x: Tensor, splits) -> list[Tensor]:
     fn_name = getattr(param_split_fn, "__name__", repr(param_split_fn))
     if not isinstance(splits, (list, tuple)) or len(splits) == 0:
         raise ValueError(f"param_split_fn ({fn_name}) must return a non-empty list/tuple of tensors")
@@ -515,10 +527,7 @@ def _validate_param_split_fn(param_split_fn: Callable, x: Tensor, splits) -> Lis
         if not isinstance(split, torch.Tensor):
             raise TypeError(f"param_split_fn ({fn_name}) returned a non-tensor value: {type(split)}")
         if split.ndim != x.ndim:
-            raise ValueError(
-                f"param_split_fn ({fn_name}) must preserve ndim. "
-                f"Input: {x.ndim}D, output: {split.ndim}D"
-            )
+            raise ValueError(f"param_split_fn ({fn_name}) must preserve ndim. Input: {x.ndim}D, output: {split.ndim}D")
         if split.ndim < 2:
             raise ValueError(f"param_split_fn ({fn_name}) returned a tensor with fewer than 2 dimensions")
         if x.ndim == 3 and split.shape[0] != x.shape[0]:
@@ -530,7 +539,7 @@ def _validate_param_split_fn(param_split_fn: Callable, x: Tensor, splits) -> Lis
 
 
 def _prepare_orthogonalization_inputs(
-    ns_inputs: List[Tensor],
+    ns_inputs: list[Tensor],
     param_split_fn: Optional[Callable],
 ):
     matrices_by_shape: dict = defaultdict(list)
@@ -560,7 +569,7 @@ def _reconstruct_orthogonalized_updates(
     orthogonalized_by_shape: dict,
     per_param_specs,
     param_recombine_fn: Optional[Callable],
-) -> List[Tensor]:
+) -> list[Tensor]:
     updates = []
     for param_specs in per_param_specs:
         split_updates = []
@@ -628,7 +637,7 @@ class MuonBase(Optimizer8bit):
         momentum: float = 0.95,
         weight_decay: float = 0.1,
         nesterov: bool = True,
-        adjust_lr: Union[str, Callable, None] = "rms_norm",
+        adjust_lr: str | Callable | None = "rms_norm",
         orthogonalize_fn: Optional[Callable[[Tensor], Tensor]] = None,
         ns_chunk_size: int = 8,
         optim_bits: int = 32,
@@ -739,7 +748,7 @@ class MuonBase(Optimizer8bit):
                     packed_init, quant_state_init = F.quantize_4bit(
                         _m_zero, blocksize=blocksize, quant_type=self._quant_type
                     )
-                state["state1"] = packed_init             # (ceil(n/2), 1), uint8
+                state["state1"] = packed_init  # (ceil(n/2), 1), uint8
                 state["absmax1"] = quant_state_init.absmax
                 del _m_zero, packed_init, quant_state_init
             state["quant_type1"] = self._quant_type
@@ -802,7 +811,7 @@ class MuonBase(Optimizer8bit):
         self,
         group: dict,
         gindex: int,
-        params: List[Tensor],
+        params: list[Tensor],
         adjust_lr_fn: Callable,
     ):
         """Apply one Muon step to a batch of same-shape parameters.
@@ -825,7 +834,7 @@ class MuonBase(Optimizer8bit):
 
         for start in range(0, len(params), self.ns_chunk_size):
             chunk = params[start : start + self.ns_chunk_size]
-            ns_inputs: List[Tensor] = []
+            ns_inputs: list[Tensor] = []
 
             for p in chunk:
                 state = self.state[p]
@@ -1014,7 +1023,7 @@ class MuonBase(Optimizer8bit):
 
     # Satisfy abstract interface (not used since we override step())
     @torch.no_grad()
-    def update_step(self, group, p, gindex, pindex):  # noqa: D102
+    def update_step(self, group, p, gindex, pindex):
         pass  # Logic lives in _update_batch; this method is never called.
 
 
@@ -1035,7 +1044,7 @@ class Muon(MuonBase):
         momentum: float = 0.95,
         weight_decay: float = 0.1,
         nesterov: bool = True,
-        adjust_lr: Union[str, Callable, None] = "rms_norm",
+        adjust_lr: str | Callable | None = "rms_norm",
         orthogonalize_fn: Optional[Callable[[Tensor], Tensor]] = None,
         ns_chunk_size: int = 8,
         optim_bits: int = 32,
@@ -1076,7 +1085,7 @@ class Muon8bit(MuonBase):
         momentum: float = 0.95,
         weight_decay: float = 0.1,
         nesterov: bool = True,
-        adjust_lr: Union[str, Callable, None] = "rms_norm",
+        adjust_lr: str | Callable | None = "rms_norm",
         orthogonalize_fn: Optional[Callable[[Tensor], Tensor]] = None,
         ns_chunk_size: int = 8,
         min_8bit_size: int = 4096,
@@ -1111,7 +1120,7 @@ class Muon32bit(MuonBase):
         momentum: float = 0.95,
         weight_decay: float = 0.1,
         nesterov: bool = True,
-        adjust_lr: Union[str, Callable, None] = "rms_norm",
+        adjust_lr: str | Callable | None = "rms_norm",
         orthogonalize_fn: Optional[Callable[[Tensor], Tensor]] = None,
         ns_chunk_size: int = 8,
         min_8bit_size: int = 4096,
@@ -1139,7 +1148,7 @@ class Muon4bit(MuonBase):
     Persistent state is ~0.5 bytes/param (two NF4/FP4 codes packed per byte,
     blocksize=64) plus a small fp32 absmax vector (~1/64 bytes/param overhead),
     giving a total of ~0.52 bytes/param — roughly half the footprint of
-    Muon8bit and ~8× less than AdamW.
+    Muon8bit and ~8x less than AdamW.
 
     NF4 (NormalFloat4) is recommended for momentum buffers because the
     quantisation levels are optimal for normally-distributed data.  FP4 is
@@ -1160,7 +1169,7 @@ class Muon4bit(MuonBase):
         momentum: float = 0.95,
         weight_decay: float = 0.1,
         nesterov: bool = True,
-        adjust_lr: Union[str, Callable, None] = "rms_norm",
+        adjust_lr: str | Callable | None = "rms_norm",
         orthogonalize_fn: Optional[Callable[[Tensor], Tensor]] = None,
         ns_chunk_size: int = 8,
         min_8bit_size: int = 4096,
@@ -1211,7 +1220,7 @@ class Muon4bitNVFP4(MuonBase):
         momentum: float = 0.95,
         weight_decay: float = 0.1,
         nesterov: bool = True,
-        adjust_lr: Union[str, Callable, None] = "rms_norm",
+        adjust_lr: str | Callable | None = "rms_norm",
         orthogonalize_fn: Optional[Callable[[Tensor], Tensor]] = None,
         ns_chunk_size: int = 8,
         min_8bit_size: int = 4096,
