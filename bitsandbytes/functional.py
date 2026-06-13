@@ -846,6 +846,41 @@ def get_4bit_type(typename, device=None, blocksize=64):
             ][::-1]
         else:
             raise NotImplementedError("4-bit AbnormalFloats currently only support blocksize 64.")
+    elif typename == "nvfp4":
+        # NVIDIA FP4 — e2m1 format (1 sign, 2 exponent bits, 1 mantissa bit),
+        # exponent bias = 1.  This is the native FP4 encoding used by Blackwell
+        # (sm100) tensor cores and exposed as torch.float4_e2m1fn_x2.
+        #
+        # Bit encoding (4 bits, MSB = sign):
+        #   0000 = +0      0001 = +0.5    0010 = +1.0    0011 = +1.5
+        #   0100 = +2.0    0101 = +3.0    0110 = +4.0    0111 = +6.0
+        #   1000 = -0      1001 = -0.5    1010 = -1.0    1011 = -1.5
+        #   1100 = -2.0    1101 = -3.0    1110 = -4.0    1111 = -6.0
+        #
+        # Values indexed 0..15 in bit-pattern order, normalized by max = 6.
+        data = [
+            0.0,          # 0000  +0
+            0.5 / 6,      # 0001  +0.5
+            1.0 / 6,      # 0010  +1.0
+            1.5 / 6,      # 0011  +1.5
+            2.0 / 6,      # 0100  +2.0
+            3.0 / 6,      # 0101  +3.0
+            4.0 / 6,      # 0110  +4.0
+            6.0 / 6,      # 0111  +6.0  (= 1.0, the maximum)
+            -0.0,         # 1000  -0    (negative zero, treated as 0)
+            -0.5 / 6,     # 1001  -0.5
+            -1.0 / 6,     # 1010  -1.0
+            -1.5 / 6,     # 1011  -1.5
+            -2.0 / 6,     # 1100  -2.0
+            -3.0 / 6,     # 1101  -3.0
+            -4.0 / 6,     # 1110  -4.0
+            -6.0 / 6,     # 1111  -6.0  (= -1.0, the minimum)
+        ]
+        # Values are already in [-1, 1]; skip the div_(abs().max()) normalisation
+        # at the end of this function by returning early.
+        data_t = torch.tensor(data, device=device)
+        assert data_t.numel() == 16
+        return data_t
 
     if data is None:
         raise NotImplementedError(f"Typename {typename} not supported")

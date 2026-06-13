@@ -15,6 +15,7 @@ from .adamw import (
 )
 from .ademamix import AdEMAMix, AdEMAMix8bit, AdEMAMix32bit, PagedAdEMAMix, PagedAdEMAMix8bit, PagedAdEMAMix32bit
 from .lamb import LAMB, LAMB8bit, LAMB32bit
+from .muon import Muon, Muon4bit, Muon4bitNVFP4, Muon8bit, Muon32bit
 from .lars import LARS, LARS8bit, LARS32bit, PytorchLARS
 from .lion import Lion, Lion8bit, Lion32bit, PagedLion, PagedLion8bit, PagedLion32bit
 from .optimizer import GlobalOptimManager
