@@ -246,6 +246,10 @@ class Optimizer8bit(torch.optim.Optimizer):
                         value[k] = cast(param, v)
 
                 return value
+            elif isinstance(value, (str, bytes)):
+                # Strings/bytes are Iterable but must be copied verbatim; e.g.
+                # Muon stores quant_type1="nf4"/"nvfp4" as plain state.
+                return value
             elif isinstance(value, container_abcs.Iterable):
                 return type(value)(cast(param, v) for v in value)
             else:

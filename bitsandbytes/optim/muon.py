@@ -199,10 +199,12 @@ def _nvfp4_quantize_eager(
     # Pad to even length for pair-processing
     m_pad = m if n % 2 == 0 else torch.cat([m, m.new_zeros(1)])
 
-    # Per-block absmax
+    # Per-block absmax. Pad the final partial block with zeros (zeros never
+    # raise the block's abs-max) so reshape works for any n.
     n_blocks = (n + blocksize - 1) // blocksize
-    m_blk = m.reshape(-1, blocksize)[:n_blocks]  # last block may be partial
-    absmax_new = m_blk.abs().amax(dim=1)  # (n_blocks,)
+    block_pad = n_blocks * blocksize - n
+    m_for_blocks = m if block_pad == 0 else torch.cat([m, m.new_zeros(block_pad)])
+    absmax_new = m_for_blocks.reshape(n_blocks, blocksize).abs().amax(dim=1)  # (n_blocks,)
     absmax.copy_(absmax_new)
 
     # Per-pair scale
@@ -376,7 +378,7 @@ def _make_sm100_nvfp4_ns_fn(
 
 
 def _default_orthogonalize_fn(
-    X: Tensor,
+X: Tensor,
 ) -> Tensor:
     """Default orthogonalize function using pure-PyTorch standard NS."""
     return _standard_newton_schulz(X)
