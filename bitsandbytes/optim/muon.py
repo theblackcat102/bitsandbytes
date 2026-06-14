@@ -33,6 +33,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Callable
+from itertools import chain
 import math
 from typing import Optional
 
@@ -41,6 +42,21 @@ from torch import Tensor
 
 import bitsandbytes.functional as F
 from bitsandbytes.optim.optimizer import MockArgs, Optimizer8bit
+
+# ---------------------------------------------------------------------------
+# Optional DTensor / distributed imports (FSDP2 support)
+# ---------------------------------------------------------------------------
+try:
+    import torch.distributed as dist
+    from torch.distributed.tensor import DTensor, Replicate, Shard
+
+    _DTENSOR_AVAILABLE = True
+except ImportError:
+    dist = None  # type: ignore[assignment]
+    DTensor = None  # type: ignore[assignment]
+    Shard = None  # type: ignore[assignment]
+    Replicate = None  # type: ignore[assignment]
+    _DTENSOR_AVAILABLE = False
 
 try:
     from bitsandbytes.backends.triton.kernels_muon import (
@@ -378,7 +394,7 @@ def _make_sm100_nvfp4_ns_fn(
 
 
 def _default_orthogonalize_fn(
-X: Tensor,
+    X: Tensor,
 ) -> Tensor:
     """Default orthogonalize function using pure-PyTorch standard NS."""
     return _standard_newton_schulz(X)
@@ -485,16 +501,233 @@ def _resolve_adjust_lr(adjust_lr) -> Callable[[float, tuple[int, ...]], float]:
 
 
 # ---------------------------------------------------------------------------
+# FSDP2 / DTensor distributed helpers — Layer A (pure, no collectives)
+# ---------------------------------------------------------------------------
+
+
+def _is_sharded(p: Tensor) -> bool:
+    """True iff p is a DTensor with at least one Shard placement (FSDP2).
+
+    False for plain tensors and fully-Replicate DTensors.  Never raises.
+    """
+    if not _DTENSOR_AVAILABLE or DTensor is None:
+        return False
+    return isinstance(p, DTensor) and any(isinstance(pl, Shard) for pl in p.placements)
+
+
+def _assert_supported_layout(p: Tensor) -> None:
+    """No-op for: plain tensor, Replicate DTensor, Shard DTensor with global ndim>=2.
+
+    Raises NotImplementedError for unsupported layouts.  Error message MUST
+    contain the bracketed token listed below so tests can match on it:
+
+      - FSDP1 FlatParameter                   -> '[FSDP1]'
+      - DeepSpeed ZeRO-3 partitioned param    -> '[ZeRO-3]'
+      - Sharded param with global ndim < 2    -> '[ndim]'
+      - is_paged=True + sharded               -> '[paged]'  (checked separately)
+
+    Message also contains the literal 'fully_shard' pointing users to FSDP2.
+    """
+    # FSDP1 FlatParameter: 1-D flat blob of many params concatenated.
+    if type(p).__name__ == "FlatParameter":
+        raise NotImplementedError(
+            "[FSDP1] FSDP1 FlatParameter is not supported by Muon. "
+            "Replace model wrapping with fully_shard (FSDP2 / DTensor)."
+        )
+    # DeepSpeed ZeRO-3 partitioned params carry ds_* attributes.
+    if hasattr(p, "ds_shape") or hasattr(p, "ds_numel") or hasattr(p, "ds_id"):
+        raise NotImplementedError(
+            "[ZeRO-3] DeepSpeed ZeRO-3 partitioned parameters are not supported "
+            "by Muon.  Use fully_shard (FSDP2 / DTensor) instead."
+        )
+    # DTensor with global ndim < 2 (e.g. a sharded bias — should be in an AdamW group).
+    if _DTENSOR_AVAILABLE and DTensor is not None and isinstance(p, DTensor):
+        if p.ndim < 2:
+            raise NotImplementedError(
+                "[ndim] Muon requires parameters with global ndim >= 2 under FSDP2. "
+                "Place 1-D params (biases, norms) in a separate AdamW group. "
+                "Use fully_shard (FSDP2 / DTensor) only for 2-D+ parameters."
+            )
+
+
+def _global_matrix_shape(p: Tensor) -> tuple[int, int]:
+    """Return the (fan_out, fan_in) 2-D shape used for NS, derived from the GLOBAL shape.
+
+    For a DTensor p.shape is the global shape; for a plain Tensor it is the regular
+    shape.  Applies the same collapse rule as _split_tensor_for_orthogonalization:
+      2-D -> as-is
+      n-D -> (shape[0], prod(shape[1:]))
+    Pure; does not gather or communicate.
+    """
+    shape = p.shape  # global shape for DTensor, local shape for plain Tensor
+    if len(shape) == 2:
+        return (shape[0], shape[1])
+    fan_in = 1
+    for s in shape[1:]:
+        fan_in *= s
+    return (shape[0], fan_in)
+
+
+def _assign_owners(costs: list[int], world_size: int) -> list[int]:
+    """Size-aware greedy LPT (Longest Processing Time) owner assignment.
+
+    costs[i] = NS cost proxy for param i; caller passes rows*cols*min(rows,cols)
+    from _global_matrix_shape.  Returns owner rank per param in [0, world_size).
+
+    Contract:
+      - Deterministic: identical output for identical (costs, world_size).
+      - Tie-break: ascending rank index, stable in input order.
+      - len(output) == len(costs); every element in range(world_size).
+    """
+    if world_size <= 1 or not costs:
+        return [0] * len(costs)
+    load = [0] * world_size
+    result = [0] * len(costs)
+    # Process in descending cost order (LPT); stable sort on original index for ties.
+    indexed = sorted(range(len(costs)), key=lambda i: (-costs[i], i))
+    for i in indexed:
+        # Assign to the least-loaded rank; tie-break by ascending rank index.
+        min_rank = min(range(world_size), key=lambda r: (load[r], r))
+        result[i] = min_rank
+        load[min_rank] += costs[i]
+    return result
+
+
+# ---------------------------------------------------------------------------
+# FSDP2 / DTensor distributed helpers — collective primitives
+# ---------------------------------------------------------------------------
+
+
+def _get_param_pg(p: Tensor):
+    """Return the ProcessGroup for the first Shard dimension of a DTensor param."""
+    mesh = p.device_mesh
+    for dim, pl in enumerate(p.placements):
+        if isinstance(pl, Shard):
+            return mesh.get_group(dim)
+    return mesh.get_group(0)
+
+
+def _param_shard_world_size(p: Tensor) -> int:
+    if not _is_sharded(p) or dist is None or not dist.is_initialized():
+        return 1
+    return dist.get_world_size(_get_param_pg(p))
+
+
+def _gather_to_owner(u_local: Tensor, p: Tensor, owner: int) -> Optional[Tensor]:
+    """Slice 2: Gather the local shard u_local from all ranks to the owner rank.
+
+    Uses explicit dist.gather over the param's process group.  Returns the
+    reconstructed full (fan_out, fan_in) tensor on the owner, None elsewhere.
+    For non-sharded params returns u_local unchanged (trivially on the owner).
+    """
+    if not _is_sharded(p):
+        return u_local
+    pg = _get_param_pg(p)
+    rank = dist.get_rank(pg)
+    world_size = dist.get_world_size(pg)
+
+    local_flat = u_local.contiguous().view(-1)
+    local_size = local_flat.numel()
+
+    if rank == owner:
+        gather_list = [
+            torch.empty(local_size, dtype=local_flat.dtype, device=local_flat.device) for _ in range(world_size)
+        ]
+        dist.gather(local_flat, gather_list, dst=owner, group=pg)
+        full_flat = torch.cat(gather_list, dim=0)
+        # Strip FSDP2 per-shard padding using global shape (unpadded).
+        global_shape = p.shape
+        n_global = 1
+        for s in global_shape:
+            n_global *= s
+        return full_flat[:n_global].reshape(global_shape)
+    else:
+        dist.gather(local_flat, None, dst=owner, group=pg)
+        return None
+
+
+def _broadcast_and_reshard(update_full: Optional[Tensor], p: Tensor, owner: int, local_shape: tuple) -> Tensor:
+    """Slice 2: Broadcast the full update from the owner to all ranks, then reshard.
+
+    Owner provides update_full; non-owners receive it via broadcast, then every
+    rank extracts its local shard using DTensor redistribute.
+    """
+    pg = _get_param_pg(p)
+    rank = dist.get_rank(pg)
+
+    if rank == owner:
+        buf = update_full.contiguous()
+    else:
+        # Allocate a buffer with the global shape to receive the broadcast.
+        global_shape = p.shape
+        buf = torch.empty(
+            global_shape,
+            dtype=update_full.dtype if update_full is not None else torch.float32,
+            device=p.to_local().device,
+        )
+
+    dist.broadcast(buf, src=owner, group=pg)
+
+    # Reshard the global update to this rank's local slice.
+    replicate_placements = [Replicate() for _ in p.placements]
+    update_dt = DTensor.from_local(buf, p.device_mesh, replicate_placements, run_check=False)
+    return update_dt.redistribute(p.device_mesh, p.placements).to_local()
+
+
+# ---------------------------------------------------------------------------
+# DTensor state helpers — wrap / unwrap optimizer state buffers
+# ---------------------------------------------------------------------------
+
+
+def _as_state_dtensor(local: Tensor, p: Tensor) -> Tensor:
+    """Wrap a local state buffer as a DTensor matching *p*'s sharding.
+
+    Storing state1/absmax1 as live DTensors lets PyTorch DCP
+    (``get_optimizer_state_dict`` / ``dcp.save``) gather and reshard them
+    across world sizes without any custom ``state_dict`` override.
+
+    For non-sharded params the local tensor is returned unchanged.
+    """
+    if not _is_sharded(p):
+        return local
+    return DTensor.from_local(local, p.device_mesh, p.placements, run_check=False)
+
+
+def _local_tensor(t: Tensor) -> Tensor:
+    """Return a local plain tensor for either a Tensor or DTensor."""
+    if DTensor is not None and isinstance(t, DTensor):
+        return t.to_local()
+    return t
+
+
+def _state_local(t: Tensor) -> Tensor:
+    """Return a local view of a state buffer, preserving in-place DTensor writes."""
+    return _local_tensor(t)
+
+
+# ---------------------------------------------------------------------------
 # Parameter batching (group same-shape params for batched NS)
 # ---------------------------------------------------------------------------
 def _create_param_batches(params: list[Tensor]) -> list[list[Tensor]]:
-    """Group params by (shape, dtype, device) for a single batched NS call."""
+    """Group params by (global_shape, dtype, device) for a single batched NS call.
+
+    For DTensor params (FSDP2) the key uses the global shape (p.shape) and the
+    local device (p.to_local().device).  Plain tensors are unchanged.
+    """
     groups: dict = defaultdict(list)
     for p in params:
-        groups[(p.shape, p.dtype, p.device)].append(p)
+        # p.shape is global shape for DTensor, regular shape for plain Tensor.
+        shape = p.shape
+        dtype = p.dtype
+        device = p.to_local().device if _is_sharded(p) else p.device
+        groups[(shape, dtype, device)].append(p)
     batches = []
     for group in groups.values():
-        group.sort(key=lambda p: p.data_ptr())
+
+        def _ptr(q: Tensor) -> int:
+            return q.to_local().data_ptr() if _is_sharded(q) else q.data_ptr()
+
+        group.sort(key=_ptr)
         batches.append(group)
     return batches
 
@@ -590,6 +823,8 @@ def _reconstruct_orthogonalized_updates(
 # Main optimizer class
 # ---------------------------------------------------------------------------
 class MuonBase(Optimizer8bit):
+    _FSDP2_QUANTIZED_WORLD_SIZE_KEY = "__bnb_quantized_shard_world_size__"
+
     """
     Muon optimizer with optional 8-bit quantized momentum buffer.
 
@@ -697,7 +932,21 @@ class MuonBase(Optimizer8bit):
 
         for group in self.param_groups:
             for p in group["params"]:
-                if p.ndim < 2:
+                # Reject unsupported sharded layouts (FSDP1, ZeRO-3) with a clear
+                # error that points users to FSDP2.  Must run before the ndim check
+                # so FSDP1 FlatParameters get the right message.
+                _assert_supported_layout(p)
+
+                # Gate paged state + FSDP2 sharding for the first cut (§7.7 / §11.B.6).
+                if is_paged and _is_sharded(p):
+                    raise NotImplementedError(
+                        "[paged] is_paged=True is not supported together with FSDP2 "
+                        "sharded parameters (DTensor).  Set is_paged=False when using "
+                        "fully_shard."
+                    )
+
+                # Plain ndim < 2 check (for non-DTensor params).
+                if not _is_sharded(p) and p.ndim < 2:
                     raise ValueError(
                         "MuonBase only supports parameters with 2 or more dimensions. "
                         "Place 1-D parameters (biases, norms) in a separate AdamW group."
@@ -710,48 +959,68 @@ class MuonBase(Optimizer8bit):
     def init_state(self, group, p, gindex, pindex):
         config = self.get_config(gindex, pindex, group)
         optim_bits = config["optim_bits"]
-        n = p.numel()
+
+        # Under FSDP2 (DTensor) the param is a sharded view; all state buffers
+        # must be sized to the LOCAL shard so quantized block layout is consistent.
+        # p_local is the plain local tensor used for device/shape queries.
+        is_sharded = _is_sharded(p)
+        if is_sharded:
+            p_local = p.to_local()
+            global_n = math.prod(tuple(p.shape))
+        else:
+            p_local = p
+            global_n = p.numel()
+        local_n = p_local.numel()
 
         state = self.state[p]
         state["step"] = 0
 
         # Fall back to fp32 for small parameters regardless of optim_bits.
-        if n < config["min_8bit_size"] or optim_bits == 32:
-            state["state1"] = self.get_state_buffer(p, dtype=torch.float32)
+        # Use global_n (world-size-independent) so the quantize-or-not decision
+        # is consistent regardless of how many ranks are training.
+        if global_n < config["min_8bit_size"] or optim_bits == 32:
+            buf = self.get_state_buffer(p_local, dtype=torch.float32)
+            # Wrap as a DTensor so DCP can gather / reshard this momentum buffer
+            # across world sizes via the standard get_optimizer_state_dict API.
+            state["state1"] = _as_state_dtensor(buf, p)
             return
 
         if optim_bits == 8:
             if "dynamic" not in self.name2qmap:
                 self.fill_qmap()
-            self.name2qmap["dynamic"] = self.name2qmap["dynamic"].to(p.device)
+            self.name2qmap["dynamic"] = self.name2qmap["dynamic"].to(p_local.device)
 
-            state["state1"] = self.get_state_buffer(p, dtype=torch.uint8)
-            state["qmap1"] = self.name2qmap["dynamic"]
+            s1 = self.get_state_buffer(p_local, dtype=torch.uint8)
+            state["state1"] = _as_state_dtensor(s1, p)
+            state["qmap1"] = self.name2qmap["dynamic"]  # replicated; stays plain
 
             blocksize = 256
-            blocks = (n + blocksize - 1) // blocksize
-            state["absmax1"] = torch.zeros((blocks,), dtype=torch.float32, device=p.device)
+            blocks = (local_n + blocksize - 1) // blocksize
+            amax = torch.zeros((blocks,), dtype=torch.float32, device=p_local.device)
+            state["absmax1"] = _as_state_dtensor(amax, p)
 
         elif optim_bits == 4:
             blocksize = 64
             if self._quant_type == "nvfp4":
                 # NVFP4 bypasses the C++ kernel entirely; allocate directly.
-                # Shape (ceil(n/2), 1) mirrors what quantize_4bit returns so
+                # Shape (ceil(n_local/2), 1) mirrors what quantize_4bit returns so
                 # the reshape(-1) in _update_batch always produces contiguous bytes.
-                n_paired = (n + 1) // 2
-                n_blocks = (n + blocksize - 1) // blocksize
-                state["state1"] = torch.zeros(n_paired, 1, dtype=torch.uint8, device=p.device)
-                state["absmax1"] = torch.zeros(n_blocks, dtype=torch.float32, device=p.device)
+                n_paired = (local_n + 1) // 2
+                n_blocks = (local_n + blocksize - 1) // blocksize
+                s1 = torch.zeros(n_paired, 1, dtype=torch.uint8, device=p_local.device)
+                state["state1"] = _as_state_dtensor(s1, p)
+                amax = torch.zeros(n_blocks, dtype=torch.float32, device=p_local.device)
+                state["absmax1"] = _as_state_dtensor(amax, p)
             else:
                 # NF4 / FP4: call quantize_4bit once on zeros to get exactly the
-                # right packed-shape (ceil(n/2), 1) without guessing it.
-                _m_zero = torch.zeros(n, dtype=torch.float32, device=p.device)
+                # right packed-shape (ceil(n_local/2), 1) without guessing it.
+                _m_zero = torch.zeros(local_n, dtype=torch.float32, device=p_local.device)
                 with torch.no_grad():
                     packed_init, quant_state_init = F.quantize_4bit(
                         _m_zero, blocksize=blocksize, quant_type=self._quant_type
                     )
-                state["state1"] = packed_init  # (ceil(n/2), 1), uint8
-                state["absmax1"] = quant_state_init.absmax
+                state["state1"] = _as_state_dtensor(packed_init, p)  # (ceil(n_local/2), 1)
+                state["absmax1"] = _as_state_dtensor(quant_state_init.absmax, p)
                 del _m_zero, packed_init, quant_state_init
             state["quant_type1"] = self._quant_type
             state["blocksize1"] = blocksize
@@ -780,13 +1049,14 @@ class MuonBase(Optimizer8bit):
             for pindex, p in enumerate(group["params"]):
                 if p.grad is None:
                     continue
-                if p.ndim < 2:
+                # Re-check layout guard at step-time (params might have been
+                # wrapped with FSDP2 after the optimizer was constructed).
+                _assert_supported_layout(p)
+                if not _is_sharded(p) and p.ndim < 2:
                     raise ValueError(
                         "MuonBase only supports parameters with 2 or more dimensions. "
                         "Place 1-D parameters (biases, norms) in a separate AdamW group."
                     )
-                p.data = p.data.contiguous()
-                p.grad = p.grad.contiguous()
                 state = self.state[p]
                 if len(state) == 0:
                     self.init_state(group, p, gindex, pindex)
@@ -818,10 +1088,24 @@ class MuonBase(Optimizer8bit):
     ):
         """Apply one Muon step to a batch of same-shape parameters.
 
-        Same-shape params are processed in chunks of `ns_chunk_size`. Momentum
-        is prepared per parameter, then Newton-Schulz inputs are split into 2-D
-        matrices, grouped by matrix shape, orthogonalized, LR-scaled by each
-        matrix shape, and reconstructed to the original parameter shape.
+        Same-shape params are processed in chunks of `ns_chunk_size`.
+
+        For plain (non-sharded) params the existing replicated path is used:
+          Phase 1 — elementwise momentum EMA → Nesterov input u_buf (per-param).
+          Phase 2 — stack u_bufs → batched NS → weight-decay + param update.
+
+        For FSDP2 sharded (DTensor) params, Pattern B (parameter-parallel) is
+        used (§6 / §9 of the design note):
+          Phase 1 — identical elementwise momentum EMA on the LOCAL SHARD only.
+                    All quantised-state machinery stays shard-local.
+          Phase 2 — gather u_buf shard to the assigned owner rank;
+                    owner runs NS on the full matrix;
+                    owner broadcasts the scaled update to all ranks;
+                    every rank reshards the update and applies it locally.
+
+        Owner assignment uses size-aware LPT (Longest Processing Time) greedy
+        scheduling (§9.5) so NS FLOPs and peak memory are distributed across
+        world_size ranks rather than duplicated.
         """
         beta = group["betas"][0]  # momentum
         nesterov = group["nesterov"]
@@ -832,17 +1116,49 @@ class MuonBase(Optimizer8bit):
         if (param_split_fn is None) != (param_recombine_fn is None):
             raise ValueError("param_split_fn and param_recombine_fn must both be provided or both be None")
 
-        shape = params[0].shape  # all same shape in this batch
+        shape = params[0].shape  # global shape (DTensor) or regular shape (plain)
 
         for start in range(0, len(params), self.ns_chunk_size):
             chunk = params[start : start + self.ns_chunk_size]
             ns_inputs: list[Tensor] = []
+            any_sharded = any(_is_sharded(p) for p in chunk)
 
+            # ----------------------------------------------------------
+            # Phase 1: elementwise momentum EMA (shard-local, unchanged)
+            # ----------------------------------------------------------
             for p in chunk:
+                # Resolve local tensor references for FSDP2 sharded params.
+                # All quantised-state buffers (state1, absmax1, qmap1) are
+                # already sized to the LOCAL shard (set up in init_state).
+                if _is_sharded(p):
+                    p_local = p.to_local()
+                    # p.grad may be a sharded or replicated DTensor.
+                    grad = _local_tensor(p.grad).contiguous()
+                    local_shape = p_local.shape
+                    p_numel = p_local.numel()
+                    p_device = p_local.device
+                else:
+                    p_local = p
+                    # Use a contiguous view for fused Triton paths; if already
+                    # contiguous this is a no-op (returns self, no allocation).
+                    # p.grad is never mutated — avoids breaking view aliases,
+                    # weight-tied parameters, and external grad references.
+                    grad = p.grad.contiguous()
+                    local_shape = shape
+                    p_numel = p.numel()
+                    p_device = p.device
+
                 state = self.state[p]
                 state["step"] += 1
-                grad = p.grad
-                u_buf = torch.empty_like(p, dtype=torch.bfloat16)
+                # u_buf is shard-sized for DTensor params, full-sized otherwise.
+                u_buf = torch.empty(local_shape, dtype=torch.bfloat16, device=p_device)
+
+                # Resolve plain local-tensor views of (possibly DTensor) state
+                # buffers.  In-place writes on s1/amax propagate back through to
+                # the DTensor's underlying storage so DCP always sees live data.
+                s1 = _state_local(state["state1"])
+                amax = _state_local(state["absmax1"]) if "absmax1" in state else None
+                qmap = state.get("qmap1")  # replicated plain tensor; already local
 
                 can_fuse_nvfp4 = (
                     "quant_type1" in state
@@ -850,17 +1166,17 @@ class MuonBase(Optimizer8bit):
                     and self._use_fused_nvfp4
                     and grad.is_cuda
                     and grad.is_contiguous()
-                    and state["state1"].is_contiguous()
-                    and state["absmax1"].is_contiguous()
+                    and s1.is_contiguous()
+                    and amax.is_contiguous()
                     and u_buf.is_contiguous()
                 )
                 if can_fuse_nvfp4:
-                    # Fused Triton NVFP4 path: single pass over data. state1 is
-                    # contiguous, so reshape(-1) is a writable flat view.
+                    # Fused Triton NVFP4 path: single pass over data.
+                    # s1 aliases the DTensor's local storage; writes go through.
                     muon_momentum_nvfp4_fused(
                         grad,
-                        state["state1"].reshape(-1),
-                        state["absmax1"],
+                        s1.reshape(-1),
+                        amax,
                         u_buf,
                         beta,
                         nesterov,
@@ -875,17 +1191,16 @@ class MuonBase(Optimizer8bit):
                     and self._use_fused_4bit
                     and grad.is_cuda
                     and grad.is_contiguous()
-                    and state["state1"].is_contiguous()
-                    and state["absmax1"].is_contiguous()
+                    and s1.is_contiguous()
+                    and amax.is_contiguous()
                     and u_buf.is_contiguous()
                 )
                 if can_fuse_4bit:
-                    # Fused Triton NF4 path: single pass over data. state1 is
-                    # contiguous, so reshape(-1) is a writable flat view.
+                    # Fused Triton NF4 path: single pass over data.
                     muon_momentum_4bit_fused(
                         grad,
-                        state["state1"].reshape(-1),
-                        state["absmax1"],
+                        s1.reshape(-1),
+                        amax,
                         u_buf,
                         beta,
                         nesterov,
@@ -895,14 +1210,14 @@ class MuonBase(Optimizer8bit):
                     continue
 
                 can_fuse_8bit = (
-                    state["state1"].dtype == torch.uint8
-                    and "qmap1" in state
+                    s1.dtype == torch.uint8
+                    and qmap is not None
                     and self._use_fused_8bit
                     and grad.is_cuda
                     and grad.is_contiguous()
-                    and state["state1"].is_contiguous()
-                    and state["absmax1"].is_contiguous()
-                    and state["qmap1"].is_contiguous()
+                    and s1.is_contiguous()
+                    and amax.is_contiguous()
+                    and qmap.is_contiguous()
                     and u_buf.is_contiguous()
                 )
                 if can_fuse_8bit:
@@ -910,9 +1225,9 @@ class MuonBase(Optimizer8bit):
                     # + requant (in place) and writes the NS input to u_buf.
                     muon_momentum_8bit_fused(
                         grad,
-                        state["state1"],
-                        state["absmax1"],
-                        state["qmap1"],
+                        s1,
+                        amax,
+                        qmap,
                         u_buf,
                         beta,
                         nesterov,
@@ -920,47 +1235,49 @@ class MuonBase(Optimizer8bit):
                     ns_inputs.append(u_buf)
                     continue
 
-                if state["state1"].dtype == torch.float32:
-                    m = state["state1"]
+                if s1.dtype == torch.float32:
+                    m = s1
                     # m = beta*m + g (mixed-dtype add casts grad in-kernel)
                     m.mul_(beta).add_(grad)
                     u = (grad + beta * m) if nesterov else m
                 elif "quant_type1" in state:
                     if state["quant_type1"] == "nvfp4":
                         # NVFP4 eager path: dequantize -> update -> requantize.
+                        # Use shard-local numel/device (p_numel, p_device).
                         m = _nvfp4_dequantize_eager(
-                            state["state1"].reshape(-1),
-                            state["absmax1"],
-                            p.numel(),
+                            s1.reshape(-1),
+                            amax,
+                            p_numel,
                             state["blocksize1"],
-                            p.device,
-                        ).view(shape)
+                            p_device,
+                        ).view(local_shape)
                         m.mul_(beta).add_(grad)
                         u = (grad + beta * m) if nesterov else m
                         _nvfp4_quantize_eager(
                             m.to(torch.float32).reshape(-1),
-                            state["state1"].reshape(-1),
-                            state["absmax1"],
+                            s1.reshape(-1),
+                            amax,
                             state["blocksize1"],
                         )
                     else:
                         # 4-bit eager path: dequantize -> update -> requantize.
+                        # QuantState.shape must be the LOCAL shard shape for FSDP2.
                         quant_state = F.QuantState(
-                            absmax=state["absmax1"],
-                            shape=p.shape,
+                            absmax=amax,
+                            shape=p_local.shape,
                             dtype=torch.float32,
                             blocksize=state["blocksize1"],
                             quant_type=state["quant_type1"],
                         )
-                        m = F.dequantize_4bit(state["state1"], quant_state=quant_state)
-                        m = m.view(shape)
+                        m = F.dequantize_4bit(s1, quant_state=quant_state)
+                        m = m.view(local_shape)
                         m.mul_(beta).add_(grad)
                         u = (grad + beta * m) if nesterov else m
                         # Requantize; out= and absmax= write into pre-allocated buffers.
                         F.quantize_4bit(
                             m.to(torch.float32).reshape(-1),
-                            out=state["state1"],
-                            absmax=state["absmax1"],
+                            out=s1,
+                            absmax=amax,
                             blocksize=state["blocksize1"],
                             quant_type=state["quant_type1"],
                         )
@@ -968,9 +1285,9 @@ class MuonBase(Optimizer8bit):
                     # 8-bit eager path: dequantize -> update -> requantize.
                     # dequantize_blockwise returns fp32 when given raw absmax.
                     m = F.dequantize_blockwise(
-                        state["state1"],
-                        absmax=state["absmax1"],
-                        code=state["qmap1"],
+                        s1,
+                        absmax=amax,
+                        code=qmap,
                         blocksize=256,
                     )
                     m.mul_(beta).add_(grad)
@@ -978,9 +1295,9 @@ class MuonBase(Optimizer8bit):
                     # Requantize momentum; absmax=/out= write state in place.
                     F.quantize_blockwise(
                         m,
-                        code=state["qmap1"],
-                        absmax=state["absmax1"],
-                        out=state["state1"],
+                        code=qmap,
+                        absmax=amax,
+                        out=s1,
                         blocksize=256,
                     )
 
@@ -988,9 +1305,66 @@ class MuonBase(Optimizer8bit):
                 ns_inputs.append(u_buf)
                 del u, m
 
+            # ----------------------------------------------------------
+            # Phase 2: NS orthogonalization + parameter update
+            # ----------------------------------------------------------
+
+            if any_sharded:
+                # FSDP2 Pattern B (§6): per-param, gather-to-owner → NS → broadcast → reshard
+                #
+                # ns_inputs[i] is the LOCAL shard of the Nesterov direction u for
+                # chunk[i].  We gather it to the assigned owner, run NS once there,
+                # broadcast the scaled update back, and let every rank reshard it to
+                # its local slice.  NS FLOPs and peak transient are divided across
+                # world_size; momentum storage stays shard-local throughout.
+
+                # Resolve distributed context from the first sharded param.
+                sharded_p = next(p for p in chunk if _is_sharded(p))
+                pg = _get_param_pg(sharded_p)
+                rank = dist.get_rank(pg)
+                world_size = dist.get_world_size(pg)
+
+                # Assign owners via LPT (size-aware greedy, §9.5).
+                global_shapes = [_global_matrix_shape(p) for p in chunk]
+                ns_costs = [r * c * min(r, c) for (r, c) in global_shapes]
+                owners = _assign_owners(ns_costs, world_size)
+
+                for p, u_local, owner, global_shape in zip(chunk, ns_inputs, owners, global_shapes):
+                    p_local = p.to_local() if _is_sharded(p) else p
+
+                    # Gather the local Nesterov input to the owner rank.
+                    # Returns the full (global) tensor on owner, None on others.
+                    u_full = _gather_to_owner(u_local, p, owner)
+
+                    if rank == owner:
+                        # Run NS on the full matrix, composing param_split_fn
+                        # AFTER the gather (§10.4 design note).
+                        u_full_list = [u_full]
+                        mats_by_shape, p_specs = _prepare_orthogonalization_inputs(u_full_list, param_split_fn)
+                        orth_by_shape = {}
+                        for mat_shape, mats in mats_by_shape.items():
+                            batched = torch.stack(mats, dim=0)
+                            orthed = self._orthogonalize_fn(batched)
+                            orth_by_shape[mat_shape] = orthed.float().mul(adjust_lr_fn(lr, mat_shape))
+                        updates_full = _reconstruct_orthogonalized_updates(orth_by_shape, p_specs, param_recombine_fn)
+                        # Reshape update to match the param's global shape.
+                        upd_full = updates_full[0].reshape(p.shape).to(torch.float32)
+                    else:
+                        upd_full = None
+
+                    # Broadcast update from owner to all ranks, then reshard to
+                    # this rank's local slice (uses DTensor redistribute).
+                    upd_local = _broadcast_and_reshard(upd_full, p, owner, p_local.shape)
+
+                    # Decoupled weight decay + parameter update on the LOCAL shard.
+                    p_local.mul_(1.0 - lr * wd).add_(upd_local.to(dtype=p_local.dtype), alpha=-1.0)
+
+                del ns_inputs
+                continue
+
+            # Non-sharded fast path: 2-D params with no param_split_fn.
+            # Preserved exactly so CPU 32-bit tests compare with tight tolerances.
             if param_split_fn is None and len(shape) == 2:
-                # Preserve the historical regular-matrix path exactly: tests
-                # compare the CPU 32-bit trajectory with very tight tolerances.
                 stacked = torch.stack(ns_inputs, dim=0)
                 orthogonalized = self._orthogonalize_fn(stacked)
                 adjusted_lr = adjust_lr_fn(lr, shape)
@@ -999,6 +1373,7 @@ class MuonBase(Optimizer8bit):
                 del stacked, orthogonalized
                 continue
 
+            # Non-sharded general path (3-D / n-D / param_split_fn).
             matrices_by_shape, per_param_specs = _prepare_orthogonalization_inputs(ns_inputs, param_split_fn)
             orthogonalized_by_shape = {}
             for matrix_shape, matrices in matrices_by_shape.items():
@@ -1022,6 +1397,148 @@ class MuonBase(Optimizer8bit):
                 p.data.mul_(1.0 - lr * wd).add_(update.to(dtype=p.dtype), alpha=-1.0)
 
             del ns_inputs, matrices_by_shape, orthogonalized_by_shape, updates
+
+    # ------------------------------------------------------------------
+    # state_dict / load_state_dict: FSDP2 checkpoint override
+    # ------------------------------------------------------------------
+
+    def state_dict(self):
+        """Return optimizer state dict compatible with PyTorch DCP.
+
+        For FSDP2 (DTensor) params, state1 and absmax1 are already live
+        DTensors in ``optimizer.state``.  We bypass Optimizer8bit's
+        ``non_castable_tensor_keys`` wrapping so that DCP's
+        ``get_optimizer_state_dict`` and ``dcp.save`` can see and reshard them
+        directly.  Quantized state is tagged with the current world size so
+        ``load_state_dict`` can reject unsupported cross-world-size reshards.
+
+        For non-sharded params the Optimizer8bit behaviour is preserved
+        (non_castable tensors are wrapped behind ``_FSDP_WRAPPED_QUANT_STATE_KEY``
+        for FSDP1 / plain ``torch.save`` compatibility).
+        """
+        all_params = list(chain.from_iterable(g["params"] for g in self.param_groups))
+        any_sharded = any(_is_sharded(p) for p in all_params)
+
+        if not any_sharded:
+            return super().state_dict()
+
+        # Use the PyTorch base-class state_dict: state1/absmax1 are already
+        # DTensors, so they appear correctly without any extra wrapping.
+        raw = torch.optim.Optimizer.state_dict(self)
+
+        # Shallow-copy each per-param dict to avoid mutating live optimizer state
+        # when we add the world-size tag below.
+        raw["state"] = {
+            k: {kk: vv for kk, vv in v.items()} if isinstance(v, dict) else v for k, v in raw["state"].items()
+        }
+
+        for idx, param_state in raw["state"].items():
+            if not isinstance(param_state, dict):
+                continue
+            p = all_params[idx]
+            if not _is_sharded(p):
+                continue
+            # Tag quantized (8/4-bit) sharded state with the saving world size
+            # so load_state_dict can raise a clear error when cross-world-size
+            # reshard is attempted (fp32 reshards cleanly; quantized does not).
+            if "qmap1" in param_state or "quant_type1" in param_state:
+                param_state[self._FSDP2_QUANTIZED_WORLD_SIZE_KEY] = _param_shard_world_size(p)
+
+        return raw
+
+    def load_state_dict(self, state_dict, move_to_device=True):
+        """Load optimizer state for FSDP2 params after DCP has resharded it.
+
+        Call pattern (worker)::
+
+            template = muon_opt.state_dict()         # DTensors with current mesh
+            dcp.load({"opt": template}, ...)         # DCP fills/reshards in-place
+            muon_opt.load_state_dict(template)       # adopt the loaded state
+
+        The DTensors for state1/absmax1 in *template* have already been
+        resharded by ``dcp.load`` to the current world size; this method
+        validates quantized-reshard safety and then adopts them directly
+        into the live optimizer state (no extra redistribute call needed).
+
+        For non-sharded params the Optimizer8bit logic is used unchanged.
+        """
+        from copy import deepcopy
+
+        all_params = list(chain.from_iterable(g["params"] for g in self.param_groups))
+        any_sharded = any(_is_sharded(p) for p in all_params)
+
+        if not any_sharded:
+            return super().load_state_dict(state_dict, move_to_device=move_to_device)
+
+        # Deep-copy to avoid mutating the caller's dict.
+        state_dict = deepcopy(state_dict)
+
+        groups = self.param_groups
+        saved_groups = state_dict["param_groups"]
+        if len(groups) != len(saved_groups):
+            raise ValueError("loaded state dict has a different number of parameter groups")
+        param_lens = (len(g["params"]) for g in groups)
+        saved_lens = (len(g["params"]) for g in saved_groups)
+        if any(p_len != s_len for p_len, s_len in zip(param_lens, saved_lens)):
+            raise ValueError(
+                "loaded state dict contains a parameter group that doesn't match the size of optimizer's group"
+            )
+
+        # Map saved integer param index → current param object.
+        id_map = {
+            old_id: p
+            for old_id, p in zip(
+                chain.from_iterable(g["params"] for g in saved_groups),
+                chain.from_iterable(g["params"] for g in groups),
+            )
+        }
+
+        new_state: dict = defaultdict(dict)
+        for k, v in state_dict["state"].items():
+            if k not in id_map:
+                new_state[k] = v
+                continue
+            p = id_map[k]
+            if not isinstance(v, dict):
+                new_state[p] = v
+                continue
+
+            # Validate cross-world-size quantized reshard: 8/4-bit block
+            # boundaries are shard-local, so resharding changes absmax layout.
+            saved_ws = v.get(self._FSDP2_QUANTIZED_WORLD_SIZE_KEY)
+            if saved_ws is not None and _is_sharded(p):
+                current_ws = _param_shard_world_size(p)
+                if int(saved_ws) != current_ws:
+                    raise NotImplementedError(
+                        "Muon 8/4-bit FSDP2 optimizer checkpoint reshard across "
+                        "world sizes is not supported: quantized momentum uses "
+                        "shard-local blockwise absmax, so block boundaries change "
+                        "when the shard size changes. Use Muon32bit for exact "
+                        "cross-world-size optimizer checkpointing."
+                    )
+
+            param_state: dict = {}
+            for sk, sv in v.items():
+                if sk == self._FSDP2_QUANTIZED_WORLD_SIZE_KEY:
+                    continue  # metadata only; not a real state entry
+                if isinstance(sv, Tensor):
+                    # DTensors (state1, absmax1): dcp.load has already resharded
+                    # them to the current world size — adopt directly as live state.
+                    # Plain tensors (qmap1, etc.): optionally move to device.
+                    if move_to_device and not (DTensor is not None and isinstance(sv, DTensor)):
+                        target_device = p.to_local().device if _is_sharded(p) else p.device
+                        sv = sv.to(target_device)
+                    param_state[sk] = sv
+                else:
+                    param_state[sk] = sv
+            new_state[p] = param_state
+
+        def update_group(group, new_group):
+            new_group["params"] = group["params"]
+            return new_group
+
+        param_groups = [update_group(g, ng) for g, ng in zip(groups, saved_groups)]
+        self.__setstate__({"state": new_state, "param_groups": param_groups})
 
     # Satisfy abstract interface (not used since we override step())
     @torch.no_grad()

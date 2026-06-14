@@ -26,13 +26,16 @@ from bitsandbytes.optim.muon import (
     _adjust_lr_rms_norm,
     _adjust_lr_spectral_norm,
     _create_param_batches,
+    _default_orthogonalize_fn,
     _make_default_orthogonalize_fn,
+    _make_sm100_nvfp4_ns_fn,
     _prepare_orthogonalization_inputs,
     _reconstruct_orthogonalized_updates,
     _reconstruct_tensor_from_matrices,
     _resolve_adjust_lr,
     _split_tensor_for_orthogonalization,
     _standard_newton_schulz,
+    _to_nvfp4_with_scales,
     _validate_param_split_fn,
     newton_schulz,
 )
@@ -51,17 +54,58 @@ def assert_most_approx_close(a, b, rtol=1e-3, atol=1e-3, max_error_count=0):
 # Capability detection (per device/variant). The CUDA C++ kernels may be
 # unbuilt or a device may be missing; detect at runtime and skip cleanly.
 # ---------------------------------------------------------------------------
+
+# Substrings (matched case-insensitively) that indicate a genuine hardware or
+# software capability gap rather than a code bug.  Only RuntimeErrors whose
+# message contains one of these patterns are treated as "not supported here".
+_SKIP_PATTERNS: tuple[str, ...] = (
+    "no cuda gpus are available",
+    "cuda is not available",
+    "not compiled with cuda",
+    "no kernel image is available",  # SM-architecture mismatch
+    "device capability",
+)
+
+
+def _is_capability_error(exc: Exception) -> bool:
+    """Return True if *exc* signals a hardware/software gap, not a code bug.
+
+    Recognised as capability gaps:
+    - ``ImportError`` / ``AttributeError``: optional package or torch op absent
+      (Triton, gram-newton-schulz, quack, torch._scaled_grouped_mm_v2, …).
+    - ``RuntimeError`` whose message matches a known CUDA availability or
+      SM-capability pattern.
+
+    Everything else (``ValueError``, ``TypeError``, ``AssertionError``, …) is
+    considered a code bug and must not be silenced.
+    """
+    if isinstance(exc, (ImportError, AttributeError)):
+        return True
+    if isinstance(exc, RuntimeError):
+        msg = str(exc).lower()
+        return any(pat in msg for pat in _SKIP_PATTERNS)
+    return False
+
+
 @functools.cache
 def _variant_supported(device: str, key: str) -> bool:
-    """Return True if a one-step Muon update of the given variant runs here."""
+    """Return True if a one-step Muon update of the given variant runs here.
+
+    Capability gaps (no CUDA, missing optional package, SM mismatch) cause the
+    function to return False so the caller can skip cleanly.  Any other
+    exception is re-raised so that implementation bugs surface as test failures
+    rather than silent skips.
+    """
     try:
         p = torch.randn(128, 64, device=device)  # 8192 elems > min_8bit_size
         p.grad = torch.randn_like(p) * 0.01
         opt = _make_variant(key, [p])
         opt.step()
         return True
-    except Exception:
-        return False
+    except Exception as exc:
+        if _is_capability_error(exc):
+            return False
+        raise
 
 
 def _make_variant(key: str, params, **kw):
@@ -490,3 +534,375 @@ def test_default_uses_gram_when_available():
 
     opt = Muon([torch.randn(8, 8)])  # no explicit orthogonalize_fn
     assert getattr(opt._orthogonalize_fn, "__self__", None).__class__ is GramNewtonSchulz
+
+
+# ===========================================================================
+# 12. SM100 FP4 tensor-core Gram Newton-Schulz path
+# ===========================================================================
+# These tests verify that the _make_sm100_nvfp4_ns_fn() path — which uses the
+# private torch._scaled_grouped_mm_v2 API with float4_e2m1fn_x2 / float8_e4m3fn
+# tensors for the X @ X.T Gram GEMM — numerically matches _standard_newton_schulz
+# and produces near-orthogonal output.
+#
+# All tests are automatically skipped when:
+#   • CUDA is unavailable, or
+#   • the GPU is not data-center Blackwell (sm100: B200=(10,0) / B300=(10,3)), or
+#   • torch._scaled_grouped_mm_v2 / float4_e2m1fn_x2 / ScalingType are absent.
+#
+# The gating in Muon4bitNVFP4.__init__ (muon.py:1718) enables
+# _make_sm100_nvfp4_ns_fn only on those two capabilities; the tests here
+# exercise that exact code path.
+# ---------------------------------------------------------------------------
+
+
+def _get_sm100_nvfp4_ns_fn():
+    """Return the FP4 NS closure, or call pytest.skip.
+
+    Performs every prerequisite check in the same order as
+    _make_sm100_nvfp4_ns_fn itself so that the test accurately reflects what
+    the production code will do on a real SM100 node.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+
+    cap = torch.cuda.get_device_capability()
+    if cap not in ((10, 0), (10, 3)):
+        pytest.skip(
+            f"SM100 FP4 tensor-core path requires device capability (10,0) or "
+            f"(10,3) (B200/B300); current GPU reports {cap}"
+        )
+
+    # Check for the private torch FP4 GEMM API
+    try:
+        from torch.nn.functional import ScalingType, SwizzleType  # noqa: F401
+
+        _ = torch._scaled_grouped_mm_v2
+        _ = torch.float4_e2m1fn_x2
+    except (ImportError, AttributeError) as exc:
+        pytest.skip(f"torch FP4 GEMM API unavailable in this PyTorch build: {exc}")
+
+    fn = _make_sm100_nvfp4_ns_fn()
+    if fn is _default_orthogonalize_fn:
+        # _make_sm100_nvfp4_ns_fn fell back to BF16 despite the checks above
+        pytest.skip(
+            "_make_sm100_nvfp4_ns_fn returned the BF16 fallback unexpectedly; "
+            "FP4 GEMM import must have failed inside the factory"
+        )
+    return fn
+
+
+class TestSM100NVFP4GramNewtonSchulz:
+    """Numerical correctness tests for the SM100 FP4 tensor-core NS path.
+
+    Structure
+    ---------
+    1. test_fp4_gram_close_to_bf16_gram
+       Directly exercises _to_nvfp4_with_scales + torch._scaled_grouped_mm_v2
+       and verifies the resulting Gram matrix is within FP4 quantization noise
+       of the bf16 reference X @ X.T.
+
+    2. test_nvfp4_ns_matches_standard_ns  (parametrised over shapes)
+       Compares the full _nvfp4_ns output against _standard_newton_schulz for
+       shapes where N % 16 == 0 (FP4 Gram path is active).  Expected tolerance
+       reflects five iterations of accumulated FP4 quantization noise.
+
+    3. test_nvfp4_ns_n_not_multiple_of_16_falls_back
+       For N % 16 != 0 the _fp4_gram inner function falls back to a pure-BF16
+       X @ X.T.  The full NS outputs must then be numerically identical to
+       _standard_newton_schulz (within BF16 rounding).
+
+    4. test_nvfp4_ns_output_near_orthogonal  (parametrised)
+       Orthogonality sanity check: (X_out @ X_out.T) / scale ≈ I.
+
+    5. test_muon4bitnvfp4_uses_fp4_ns_on_sm100
+       Optimizer-level smoke test: Muon4bitNVFP4 with orthogonalize_fn=None
+       (auto-select) completes a step without error and produces finite params.
+
+    6. test_muon4bitnvfp4_fp4_ns_trajectory_close_to_bf16
+       10-step trajectory: Muon4bitNVFP4 (FP4 NS, FP4 momentum) stays within
+       atol=0.05 of Muon32bit (_standard_newton_schulz) per step.
+    """
+
+    DEVICE = "cuda"
+
+    @pytest.fixture(autouse=True)
+    def _setup(self):
+        # Skip the whole class if prerequisites are not met; store the FP4 NS
+        # function so individual tests can call it via self._nvfp4_ns.
+        self._nvfp4_ns = _get_sm100_nvfp4_ns_fn()
+
+    # ------------------------------------------------------------------
+    # 1. FP4 Gram ≈ BF16 Gram
+    # ------------------------------------------------------------------
+    @pytest.mark.parametrize(
+        "shape",
+        [(64, 64), (32, 128), (48, 96), (64, 128)],
+        ids=lambda s: f"{s[0]}x{s[1]}",
+    )
+    def test_fp4_gram_close_to_bf16_gram(self, shape):
+        """X @ X.T via FP4 GEMM should be within FP4 quantization noise of bf16.
+
+        FP4 has 4-bit precision with 1x16 block-wise FP8 scales.  Per-element
+        quantization error is bounded by (absmax / 7) / 2 per block.  After
+        accumulating over N columns the Gram-matrix element error grows as
+        ~sqrt(N) x (per-element error), which for the shapes tested here stays
+        well below atol=0.05.
+
+        This test exercises _to_nvfp4_with_scales and torch._scaled_grouped_mm_v2
+        directly, exactly as _fp4_gram does inside _make_sm100_nvfp4_ns_fn.
+        """
+        from torch.nn.functional import ScalingType, SwizzleType
+
+        m, n = shape
+        assert n % 16 == 0, "test requires N divisible by 16 to exercise the FP4 path"
+
+        torch.manual_seed(7)
+        # Frobenius-normalize as _nvfp4_ns would before computing the Gram
+        X = torch.randn(m, n, dtype=torch.bfloat16, device=self.DEVICE)
+        X = (X / X.norm()).contiguous()
+
+        # BF16 reference
+        G_bf16 = (X @ X.mT).float()
+
+        # FP4 path
+        X_fp4, scale_X = _to_nvfp4_with_scales(X, block_size=16)
+        X_T_fp4 = X_fp4.t().contiguous()  # (n//2, m)
+        scale_X_T = scale_X.t().contiguous()  # (n//16, m)
+        G_fp4 = torch._scaled_grouped_mm_v2(
+            X_fp4,
+            X_T_fp4,
+            [scale_X],
+            [ScalingType.BlockWise1x16],
+            [SwizzleType.SWIZZLE_32_4_4],
+            [scale_X_T],
+            [ScalingType.BlockWise1x16],
+            [SwizzleType.SWIZZLE_32_4_4],
+            None,
+            torch.bfloat16,
+        ).float()
+
+        torch.testing.assert_close(
+            G_fp4,
+            G_bf16,
+            atol=0.05,
+            rtol=0.1,
+            msg=(
+                f"FP4 Gram matrix deviates from BF16 reference beyond expected "
+                f"quantization noise for shape {shape}. "
+                "This likely indicates a bug in _to_nvfp4_with_scales packing or "
+                "an incorrect scale/swizzle configuration in the _sgmm call."
+            ),
+        )
+
+    # ------------------------------------------------------------------
+    # 2. Full NS: FP4 path ≈ BF16 reference (N % 16 == 0)
+    # ------------------------------------------------------------------
+    @pytest.mark.parametrize(
+        "shape",
+        [
+            (64, 64),  # square, FP4 Gram active
+            (48, 96),  # wide (m < n), FP4 Gram active
+            (96, 48),  # tall (m > n), transposed internally → FP4 Gram on (48, 96)
+            (32, 128),  # wide, larger N
+        ],
+        ids=lambda s: f"{s[0]}x{s[1]}",
+    )
+    def test_nvfp4_ns_matches_standard_ns(self, shape):
+        """_nvfp4_ns should match _standard_newton_schulz within FP4 noise budget.
+
+        Both paths Frobenius-normalize X, run 5 NS iterations with the same
+        POLAR_EXPRESS_COEFFICIENTS, and return the near-orthogonal result.  The
+        FP4 path replaces only the X @ X.T Gram GEMM; all other arithmetic
+        (polynomial evaluation, X update, transpose bookkeeping) stays in BF16.
+
+        Five iterations of accumulated FP4 quantization noise → atol=0.1 is a
+        generous but finite bound.  A value much larger than this would indicate
+        the FP4 Gram is a poor approximation that destabilises the NS recurrence.
+        """
+        torch.manual_seed(13)
+        X = torch.randn(*shape, dtype=torch.bfloat16, device=self.DEVICE)
+
+        out_fp4 = self._nvfp4_ns(X.clone()).float()
+        out_bf16 = _standard_newton_schulz(X.clone()).float()
+
+        torch.testing.assert_close(
+            out_fp4,
+            out_bf16,
+            atol=0.1,
+            rtol=0.2,
+            msg=(
+                f"SM100 FP4 NS output deviates from BF16 NS by more than the "
+                f"expected FP4 quantization noise budget for shape {shape}. "
+                "Check _fp4_gram packing or the NS iteration loop."
+            ),
+        )
+
+    # ------------------------------------------------------------------
+    # 3. N not divisible by 16 → BF16 fallback inside _fp4_gram
+    # ------------------------------------------------------------------
+    @pytest.mark.parametrize(
+        "shape",
+        [(64, 48), (32, 60)],
+        ids=lambda s: f"{s[0]}x{s[1]}",
+    )
+    def test_nvfp4_ns_n_not_multiple_of_16_falls_back(self, shape):
+        """When N % 16 != 0, _fp4_gram uses bf16 X @ X.T and outputs must match.
+
+        The _fp4_gram function guards with ``if n % 16 != 0: return X @ X.mT``.
+        In that branch the full _nvfp4_ns is arithmetically identical to
+        _standard_newton_schulz (same BF16 ops, same coefficients), so the
+        outputs should agree up to floating-point rounding (atol=1e-4).
+
+        This test confirms the fallback guard is reached and does not silently
+        use FP4 on unsupported dimensions, which would produce wrong results.
+        """
+        _, n = shape
+        assert n % 16 != 0, "test is only meaningful when N is not divisible by 16"
+
+        torch.manual_seed(99)
+        X = torch.randn(*shape, dtype=torch.bfloat16, device=self.DEVICE)
+
+        out_fp4 = self._nvfp4_ns(X.clone()).float()
+        out_bf16 = _standard_newton_schulz(X.clone()).float()
+
+        torch.testing.assert_close(
+            out_fp4,
+            out_bf16,
+            atol=1e-4,
+            rtol=1e-3,
+            msg=(
+                f"BF16 fallback path in _nvfp4_ns should be numerically identical "
+                f"to _standard_newton_schulz for shape {shape} (N % 16 != 0). "
+                "The fallback guard may be broken or the wrong code path was taken."
+            ),
+        )
+
+    # ------------------------------------------------------------------
+    # 4. Output is near-orthogonal
+    # ------------------------------------------------------------------
+    @pytest.mark.parametrize(
+        "shape",
+        [(64, 64), (48, 96), (96, 48)],
+        ids=lambda s: f"{s[0]}x{s[1]}",
+    )
+    def test_nvfp4_ns_output_near_orthogonal(self, shape):
+        """FP4 NS output X satisfies X @ X.T ≈ (trace/k) * I (near-orthogonal).
+
+        Newton-Schulz orthogonalizes the input; the output should satisfy
+        X X^T ≈ scaled identity for m ≤ n, or X^T X ≈ scaled identity for m > n.
+        We measure the normalized off-diagonal Frobenius norm of the Gram matrix
+        and require it to be below 0.1 (10 % of the diagonal magnitude).
+
+        A failure here means FP4 quantization noise is large enough to prevent
+        the NS recurrence from converging to a near-orthogonal matrix, which
+        would make the optimizer update step numerically meaningless.
+        """
+        torch.manual_seed(17)
+        X = torch.randn(*shape, dtype=torch.bfloat16, device=self.DEVICE)
+        out = self._nvfp4_ns(X).float()
+
+        m, n = shape
+        if m <= n:
+            gram = out @ out.T  # (m, m)
+            k = m
+        else:
+            gram = out.T @ out  # (n, n)
+            k = n
+
+        trace_per_dim = gram.trace() / k
+        eye_approx = torch.eye(k, device=self.DEVICE, dtype=torch.float32) * trace_per_dim
+        off_diag_norm = (gram - eye_approx).norm()
+        normalized_error = off_diag_norm / (k * trace_per_dim.abs().clamp(min=1e-6))
+
+        assert normalized_error < 0.1, (
+            f"FP4 NS output not near-orthogonal for shape {shape}: "
+            f"normalized off-diagonal Frobenius norm = {normalized_error:.4f} > 0.1. "
+            "FP4 quantization noise may be too large for the NS recurrence to converge."
+        )
+
+    # ------------------------------------------------------------------
+    # 5. Batched (B, m, n) input handled correctly
+    # ------------------------------------------------------------------
+    def test_nvfp4_ns_batched_input(self):
+        """_nvfp4_ns handles (B, m, n) input and matches _standard_newton_schulz."""
+        torch.manual_seed(31)
+        X = torch.randn(3, 48, 64, dtype=torch.bfloat16, device=self.DEVICE)
+
+        out_fp4 = self._nvfp4_ns(X.clone()).float()
+        out_bf16 = _standard_newton_schulz(X.clone()).float()
+
+        torch.testing.assert_close(out_fp4, out_bf16, atol=0.1, rtol=0.2)
+
+    # ------------------------------------------------------------------
+    # 6. Optimizer smoke test: Muon4bitNVFP4 runs without error on SM100
+    # ------------------------------------------------------------------
+    def test_muon4bitnvfp4_uses_fp4_ns_on_sm100(self):
+        """Muon4bitNVFP4 (orthogonalize_fn=None) should use the FP4 NS path on SM100.
+
+        When orthogonalize_fn is not supplied, Muon4bitNVFP4.__init__ detects
+        SM100 capability and calls _make_sm100_nvfp4_ns_fn() (muon.py:1718-1719).
+        We verify the step completes without error and produces finite parameters.
+
+        A failure here (non-finite output, RuntimeError, etc.) indicates the
+        FP4 GEMM API is broken for the shapes that arise in a real optimizer step.
+        """
+        torch.manual_seed(42)
+        p = torch.randn(96, 64, device=self.DEVICE)
+        p.grad = torch.randn_like(p) * 0.01
+
+        opt = Muon4bitNVFP4([p])  # orthogonalize_fn=None → auto-selects FP4 NS
+        opt.step()
+
+        assert torch.isfinite(p).all(), (
+            "Muon4bitNVFP4 step produced non-finite parameter values on SM100. "
+            "The FP4 tensor-core NS path or the FP4 momentum update kernel has "
+            "a numerical stability problem."
+        )
+
+    # ------------------------------------------------------------------
+    # 7. 10-step trajectory: FP4 NS stays close to BF16 Muon32bit
+    # ------------------------------------------------------------------
+    def test_muon4bitnvfp4_fp4_ns_trajectory_close_to_bf16(self):
+        """On SM100, Muon4bitNVFP4 (FP4 NS + FP4 momentum) stays near Muon32bit.
+
+        Both optimisers share the same hyperparameters.  Muon32bit uses
+        _standard_newton_schulz; Muon4bitNVFP4 auto-selects _nvfp4_ns on SM100.
+        We compare parameter values after each of 10 steps, resetting the
+        quantised params to the fp32 reference after each step so we measure
+        per-step divergence rather than accumulated drift.
+
+        atol=0.05 is intentionally generous: it catches catastrophic failures
+        (wrong sign, NaN, large truncation error in the FP4 path) while
+        permitting the expected ~1-2 % per-step quantisation error from both the
+        FP4 NS and the FP4 momentum buffer.
+        """
+        torch.manual_seed(0)
+        p32 = torch.randn(96, 64, device=self.DEVICE)
+        pfp4 = p32.clone()
+
+        o32 = Muon32bit(
+            [p32],
+            lr=5e-3,
+            momentum=0.9,
+            weight_decay=0.0,
+            orthogonalize_fn=_standard_newton_schulz,
+        )
+        # orthogonalize_fn=None → SM100 auto-selects _nvfp4_ns
+        ofp4 = Muon4bitNVFP4([pfp4], lr=5e-3, momentum=0.9, weight_decay=0.0)
+
+        for step in range(10):
+            g = torch.randn(96, 64, device=self.DEVICE) * 0.05
+            p32.grad = g.clone()
+            pfp4.grad = g.clone()
+            o32.step()
+            ofp4.step()
+
+            assert_most_approx_close(
+                pfp4.float(),
+                p32.float(),
+                atol=0.05,
+                rtol=0.05,
+                max_error_count=p32.numel() // 10,
+            )
+            # Reset quantised params so divergence is measured per-step
+            pfp4.data.copy_(p32.data)
